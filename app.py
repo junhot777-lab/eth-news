@@ -1,4 +1,8 @@
-import os, sqlite3, threading, time, feedparser
+import os
+import sqlite3
+import threading
+import time
+import feedparser
 from flask import Flask, jsonify, render_template_string, request, session
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -6,7 +10,9 @@ app = Flask(__name__)
 app.secret_key = "Philia12-key"
 
 ADMIN_PASSWORD = "Philia12"
-DB_PATH = os.path.join("/tmp", "data", "articles.db")
+DB_DIR = "/tmp/data"
+DB_PATH = os.path.join(DB_DIR, "articles.db")
+
 FEEDS = [
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
@@ -15,7 +21,7 @@ FEEDS = [
 
 # ---------- DB 초기화 ----------
 def ensure_dirs():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    os.makedirs(DB_DIR, exist_ok=True)
 
 def init_db():
     ensure_dirs()
@@ -36,17 +42,22 @@ def init_db():
 def insert_article(title, link, source, date):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO articles (title, link, source, date) VALUES (?, ?, ?, ?)",
-              (title, link, source, date))
+    c.execute(
+        "INSERT INTO articles (title, link, source, date) VALUES (?, ?, ?, ?)",
+        (title, link, source, date),
+    )
     conn.commit()
     conn.close()
 
 def query_articles(q=None):
+    init_db()  # 혹시 모를 누락 방지
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if q:
-        c.execute("SELECT title, link, source, date FROM articles WHERE title LIKE ? ORDER BY id DESC",
-                  (f"%{q}%",))
+        c.execute(
+            "SELECT title, link, source, date FROM articles WHERE title LIKE ? ORDER BY id DESC",
+            (f"%{q}%",),
+        )
     else:
         c.execute("SELECT title, link, source, date FROM articles ORDER BY id DESC")
     rows = c.fetchall()
@@ -55,6 +66,7 @@ def query_articles(q=None):
 
 # ---------- RSS 수집 ----------
 def fetch_articles():
+    init_db()  # Render 재부팅시 항상 DB부터 보장
     seen = set()
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -69,8 +81,16 @@ def fetch_articles():
     for feed_url in FEEDS:
         feed = feedparser.parse(feed_url)
         for entry in feed.entries[:10]:
-            if "이더리움" in entry.title and entry.link not in seen:
-                insert_article(entry.title, entry.link, feed.feed.get("title", "unknown"), entry.get("published", ""))
+            link = entry.get("link")
+            if not link:
+                continue
+            if "이더리움" in entry.title and link not in seen:
+                insert_article(
+                    entry.title,
+                    link,
+                    feed.feed.get("title", "unknown"),
+                    entry.get("published", ""),
+                )
                 count += 1
     print(f"[FETCH] cycle done. added={count} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -109,14 +129,21 @@ def api_articles():
         try:
             from dateutil import parser as dtparser
             return dtparser.parse(s).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        except:
+        except Exception:
             return s
-    return jsonify({"articles": [
-        {"title": r[0], "link": r[1], "source": r[2] or "", "published_at_local": to_local(r[3])}
-        for r in rows
-    ]})
+    return jsonify({
+        "articles": [
+            {
+                "title": r[0],
+                "link": r[1],
+                "source": r[2] or "",
+                "published_at_local": to_local(r[3]),
+            }
+            for r in rows
+        ]
+    })
 
-# ---------- 앱 부팅 시 즉시 DB 보장 ----------
+# ---------- 앱 부팅 시 즉시 DB 생성 ----------
 print("[BOOT] Flask app starting; ensuring DB structure...")
 try:
     init_db()
