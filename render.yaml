@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: eth-news
+    env: python
+    plan: free
+    region: singapore   # 서울 없으면 여기로, 가까운 리전 아무거나
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: FETCH_INTERVAL_SEC
+        value: 60
+      - key: ADMIN_PASSWORD
+        value: Philia12
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DB_PATH
+        value: /data/articles.db
+    disk:
+      name: sqlite
+      mountPath: /data
+      sizeGB: 1

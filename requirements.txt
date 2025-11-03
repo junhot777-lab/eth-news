@@ -1,0 +1,6 @@
+flask==3.1.2
+feedparser
+apscheduler
+python-dateutil
+html5lib
+gunicorn
