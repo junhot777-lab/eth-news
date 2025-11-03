@@ -95,13 +95,12 @@ def fetch_articles():
     print(f"[FETCH] cycle done. added={count} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ---------- Flask 라우트 ----------
-@app.before_first_request
-def setup():
+@app.before_request
+def ensure_db_before_request():
     try:
         init_db()
-        print("[INIT] DB ensured before first request.")
     except Exception as e:
-        print("[INIT ERROR]", e)
+        print("[DB INIT ERROR]", e)
 
 @app.get("/")
 def home():
