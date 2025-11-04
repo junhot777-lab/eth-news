@@ -1,159 +1,181 @@
+# app.py — ETH 뉴스 집계 (Render 최종 안정판: 최신순 + 누적 로드 + 잠금)
 import os, sqlite3, time, feedparser
 from flask import Flask, jsonify, render_template_string, request, session
 from apscheduler.schedulers.background import BackgroundScheduler
 
-app = Flask(__name__)
-app.secret_key = "Philia12-key"
-
+# --------- 기본 설정 ---------
 ADMIN_PASSWORD = "Philia12"
-DB_DIR = "/tmp/data"
+SECRET_KEY = "Philia12-key"     # 필요시 Render 환경변수로 바꿔도 됨
+DB_DIR = "/tmp/data"            # Render 무료 플랜: /tmp만 쓰기 가능
 DB_PATH = os.path.join(DB_DIR, "articles.db")
 
+# RSS 소스 (원하면 추가 가능)
 FEEDS = [
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://www.coindeskkorea.com/rss/allArticle.xml",
+    "https://www.coindeskkorea.com/rss/allArticle.xml",  # KR
 ]
-REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (Render-eth-news)"}
+REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (eth-news-render)"}
 
-# ---------- DB ----------
+# 키워드(제목+요약에 대소문자 무시 포함 매칭)
+KEYWORDS = ["이더리움", "이더", "ethereum", " ether ", " eth ", "(eth)", "[eth]", "以太坊"]
+
+# --------- Flask ---------
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# --------- DB 유틸 ---------
 def ensure_db():
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS articles(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT, link TEXT UNIQUE, source TEXT, date TEXT
-    )""")
-    conn.commit(); conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        # published: epoch(int), created: epoch(int)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            link TEXT UNIQUE,
+            source TEXT,
+            published INTEGER,
+            created INTEGER
+        )
+        """)
+        conn.commit()
 
-def insert_article(title, link, source, date):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO articles(title,link,source,date) VALUES (?,?,?,?)",
-              (title, link, source, date))
-    conn.commit(); conn.close()
+def query_sql(sql, params=()):
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(sql, params).fetchall()
 
-def query(q=None):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    if q:
-        c.execute("SELECT title,link,source,date FROM articles WHERE title LIKE ? ORDER BY id DESC",
-                  (f"%{q}%",))
-    else:
-        c.execute("SELECT title,link,source,date FROM articles ORDER BY id DESC")
-    rows = c.fetchall(); conn.close(); return rows
+def insert_article(title, link, source, published_epoch):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO articles (title, link, source, published, created)
+            VALUES (?, ?, ?, ?, ?)
+        """, (title, link, source, int(published_epoch), int(time.time())))
+        conn.commit()
 
-# ---------- Filter ----------
-KEYWORDS = [
-    "이더리움","이더","ethereum"," ether "," eth ","(eth)","[eth]","以太坊"
-]
-def match(text: str) -> bool:
-    t = f" {text.lower()} "
+# --------- 키워드 매칭 ---------
+def match_keyword(title: str, summary: str = "") -> bool:
+    t = f" {str(title).lower()} {str(summary).lower()} "
     return any(k.lower() in t for k in KEYWORDS)
 
-# ---------- Fetch ----------
-def fetch_articles(max_per_feed=30):
-    ensure_db()
-    # 이미 본 링크 메모
-    seen = set()
-    try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("SELECT link FROM articles"); seen = {r[0] for r in c.fetchall()}
-        conn.close()
-    except Exception as e:
-        print("[FETCH] read-seen error:", e)
+# --------- 날짜 파싱(의존성 최소화: feedparser의 parsed 사용) ---------
+def to_epoch(entry) -> int:
+    for key in ("published_parsed", "updated_parsed"):
+        st = entry.get(key)
+        if st:  # time.struct_time
+            try:
+                return int(time.mktime(st))
+            except Exception:
+                pass
+    # 최후 수단: 지금 시각
+    return int(time.time())
 
-    added = 0; scanned = 0
+# --------- 수집 루틴 ---------
+def fetch_articles(max_per_feed=40):
+    ensure_db()
+
+    # 이미 본 링크 메모
+    seen = set(r[0] for r in query_sql("SELECT link FROM articles"))
+    scanned, added = 0, 0
+
     for url in FEEDS:
         try:
             fp = feedparser.parse(url, request_headers=REQUEST_HEADERS)
             src = fp.feed.get("title", url)
-            entries = fp.entries[:max_per_feed]
-            for e in entries:
+            for e in fp.entries[:max_per_feed]:
                 scanned += 1
-                title = e.get("title","")
+                title = e.get("title", "")
                 link  = e.get("link")
-                summary = e.get("summary","")
-                # 제목 + 요약을 함께 검사
-                text_for_filter = f"{title} {summary}"
-                if not link or not title: 
+                summary = e.get("summary", "")
+                if not title or not link:
                     continue
-                if match(text_for_filter) and link not in seen:
-                    insert_article(title, link, src, e.get("published",""))
+                if match_keyword(title, summary) and link not in seen:
+                    insert_article(title, link, src, to_epoch(e))
                     added += 1
-        except Exception as e:
-            print(f"[FETCH] feed error {url} ->", e)
+        except Exception as ex:
+            print(f"[FETCH] feed error {url} ->", ex)
 
-    print(f"[FETCH] scanned={scanned} added={added} at {time.strftime('%H:%M:%S')}")
-    # 완전 빈 DB면 보기용으로 최근 몇 개라도 채워 넣기(필터 무시, 사용자 경험용)
-    try:
-        if len(query()) == 0:
-            for url in FEEDS:
-                fp = feedparser.parse(url, request_headers=REQUEST_HEADERS)
-                src = fp.feed.get("title", url)
-                for e in fp.entries[:8]:
-                    title = e.get("title",""); link = e.get("link")
-                    if link and title:
-                        insert_article(title, link, src, e.get("published",""))
-            print("[FETCH] fallback seeded some articles")
-    except Exception as e:
-        print("[FETCH] fallback error:", e)
+    print(f"[FETCH] scanned={scanned} added={added} {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ---------- Flask ----------
-@app.before_request
-def _ensure():
-    try: ensure_db()
-    except Exception as e: print("[DB]", e)
-
-@app.get("/")
-def home():
-    return render_template_string(HTML)
-
+# --------- 잠금/인증 ---------
 @app.post("/unlock")
 def unlock():
     j = request.get_json(silent=True) or {}
     if j.get("password") == ADMIN_PASSWORD:
         session["unlocked"] = True
         return jsonify({"success": True})
-    return jsonify({"success": False, "error":"비밀번호가 올바르지 않습니다."}), 401
+    return jsonify({"success": False, "error": "비밀번호가 올바르지 않습니다."}), 401
 
 @app.get("/api/unlocked")
 def api_unlocked():
     return jsonify({"unlocked": bool(session.get("unlocked"))})
 
+# --------- 최신순 + 누적 로드 API ---------
 @app.get("/api/articles")
 def api_articles():
     if not session.get("unlocked"):
-        return jsonify({"error":"locked"}), 401
-    q = request.args.get("q","").strip() or None
-    rows = query(q)
-    def to_local(s):
-        try:
-            from dateutil import parser as dtp
-            return dtp.parse(s).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return s
-    return jsonify({"articles":[
-        {"title":r[0], "link":r[1], "source":r[2] or "", "published_at_local": to_local(r[3])}
-        for r in rows
-    ]})
+        return jsonify({"error": "locked"}), 403
 
-# ---- Admin: 강제 수집 & 상태 확인 ----
+    q = (request.args.get("q") or "").strip()
+    before = request.args.get("before")    # 커서: 이 epoch 보다 과거 것 더 가져옴
+    limit = int(request.args.get("limit") or 30)
+
+    sql = "SELECT title, link, source, published FROM articles"
+    conds, params = [], []
+
+    if q:
+        conds.append("(title LIKE ? OR source LIKE ?)")
+        like = f"%{q}%"
+        params += [like, like]
+
+    if before:
+        try:
+            conds.append("published < ?")
+            params.append(int(before))
+        except Exception:
+            pass
+
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+
+    # 최신이 위: published DESC, 같은 시각이면 id DESC
+    sql += " ORDER BY published DESC, id DESC LIMIT ?"
+    params.append(limit)
+
+    rows = query_sql(sql, tuple(params))
+    items = [{"title": r[0], "link": r[1], "source": r[2] or "", "published": int(r[3])} for r in rows]
+    return jsonify({"articles": items})
+
+# --------- 강제 수집/상태 ---------
 @app.get("/admin/fetch")
 def admin_fetch():
     if request.args.get("pw") != ADMIN_PASSWORD:
-        return jsonify({"ok":False, "error":"nope"}), 401
-    before = len(query())
+        return jsonify({"ok": False, "error": "nope"}), 401
+    before = query_sql("SELECT COUNT(*) FROM articles")[0][0]
     fetch_articles()
-    after = len(query())
-    return jsonify({"ok":True, "added": after - before, "total": after})
+    after = query_sql("SELECT COUNT(*) FROM articles")[0][0]
+    return jsonify({"ok": True, "added": after - before, "total": after})
 
 @app.get("/admin/ping")
 def admin_ping():
-    return jsonify({"ok": True, "count": len(query())})
+    total = query_sql("SELECT COUNT(*) FROM articles")[0][0]
+    return jsonify({"ok": True, "total": total})
 
-# ---------- Boot ----------
+# --------- 페이지 ---------
+@app.before_request
+def ensure_on_each_request():
+    try:
+        ensure_db()
+    except Exception as e:
+        print("[DB INIT ERROR]", e)
+
+@app.get("/")
+def home():
+    return render_template_string(HTML)
+
+# --------- 부팅 시 1회 수집 + 주기 수집 ---------
 print("[BOOT] init & first fetch…")
 ensure_db()
 fetch_articles()  # 시작 즉시 1회
@@ -161,52 +183,116 @@ sched = BackgroundScheduler()
 sched.add_job(fetch_articles, "interval", minutes=30)
 sched.start()
 
+# --------- 프런트(최신순 + 누적 '더 보기') ---------
 HTML = """
-<!doctype html><html lang="ko"><head><meta charset="utf-8">
-<title>이더리움 뉴스 집계기</title>
+<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>이더리움 뉴스 집계</title>
 <style>
-body{font-family:Arial;background:#111;color:#eee;text-align:center}
-input,button{padding:8px;margin:5px;border-radius:6px;border:none}
-.card{background:#222;margin:10px auto;padding:10px;border-radius:10px;width:90%;max-width:720px}
-a{color:#00bcd4;text-decoration:none}.small{color:#aaa;font-size:12px}#msg{color:#ffb74d}
-</style></head><body>
-<h2>이더리움 뉴스 집계기</h2>
-<div id="lock" style="display:none">
-  <p>관리자 비밀번호 입력:</p>
-  <input type="password" id="pw"><button onclick="unlock()">잠금 해제</button>
-  <p id="msg"></p>
+body{font-family:system-ui,Segoe UI,Noto Sans KR,Arial;background:#0b0d10;color:#e6e9ee;margin:0}
+header{position:sticky;top:0;background:#0f1216;border-bottom:1px solid #1c2128;padding:16px}
+.wrap{max-width:920px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0}.meta{opacity:.7;font-size:12px}
+#q{width:100%;padding:8px 10px;border-radius:10px;border:1px solid #2a3240;background:#0b0f14;color:#e6e9ee;margin-top:8px}
+.card{background:#11151a;border:1px solid #1f2630;border-radius:14px;padding:16px;margin:12px 0}
+.card a{color:#9ecbff;text-decoration:none}.card a:hover{text-decoration:underline}
+.badge{display:inline-block;padding:2px 8px;border:1px solid #2a3240;border-radius:999px;font-size:12px;opacity:.8}
+.muted{opacity:.7}
+.center{display:flex;justify-content:center;margin:10px 0}
+button{padding:10px 14px;border-radius:10px;border:none;cursor:pointer;background:#1b2838;color:#e6e9ee}
+.overlay{position:fixed;inset:0;background:rgba(3,5,7,.88);display:flex;align-items:center;justify-content:center;z-index:9999}
+.lock{background:#0b1220;padding:24px;border-radius:12px;border:1px solid #22303a;min-width:320px}
+.lock input{width:100%;padding:10px;border-radius:8px;border:1px solid #21303a;background:#081018;color:#e6eef8}
+.lock button{margin-top:10px}
+.err{color:#ff8b8b;margin-top:8px;font-size:13px}
+</style>
+</head>
+<body>
+<div id="overlay" class="overlay" style="display:none">
+  <div class="lock">
+    <h3>화면 잠금</h3>
+    <p class="muted">관리자 비밀번호를 입력하세요.</p>
+    <input id="pw" type="password" placeholder="비밀번호">
+    <button onclick="doUnlock()">잠금 해제</button>
+    <div id="err" class="err"></div>
+  </div>
 </div>
-<div id="content" style="display:none">
-  <input id="search" placeholder="검색어 입력" oninput="load()">
-  <div id="hint" class="small"></div>
-  <div id="articles"></div>
-</div>
+
+<header><div class="wrap">
+  <h1>이더리움 실시간 뉴스 집계</h1>
+  <div class="meta">최신순 • 필요시 아래 '더 보기'로 과거 기사 계속 누적</div>
+  <input id="q" type="search" placeholder="제목/매체로 검색 (Enter)" />
+</div></header>
+
+<main class="wrap">
+  <div id="list"></div>
+  <div class="center"><button id="more" style="display:none;">더 보기</button></div>
+  <div id="hint" class="muted center"></div>
+</main>
+
 <script>
-async function check(){let r=await fetch('/api/unlocked');let j=await r.json();
-  if(j.unlocked){document.getElementById('content').style.display='block';load();}
-  else document.getElementById('lock').style.display='block';}
-async function unlock(){
-  let pw=document.getElementById('pw').value;
-  let r=await fetch('/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
-  let j=await r.json();
-  if(j.success){document.getElementById('lock').style.display='none';document.getElementById('content').style.display='block';load();}
-  else document.getElementById('msg').innerText=j.error||'실패';}
-async function load(){
-  let q=document.getElementById('search').value, hint=document.getElementById('hint');
-  let r=await fetch('/api/articles?q='+encodeURIComponent(q));
-  if(r.status===401){document.getElementById('lock').style.display='block';document.getElementById('content').style.display='none';return;}
-  let j=await r.json(); let box=document.getElementById('articles'); box.innerHTML='';
-  if(!j.articles || j.articles.length===0){hint.innerText='표시할 기사가 없습니다. 잠시만 기다리거나 상단의 /admin/fetch로 강제 수집하세요.'; return;}
-  hint.innerText='';
-  j.articles.forEach(a=>{
-    let d=document.createElement('div'); d.className='card';
-    d.innerHTML=`<a href="${a.link}" target="_blank">${a.title}</a><br><div class="small">${a.source} | ${a.published_at_local||''}</div>`;
-    box.appendChild(d);
-  });
+let loading=false, lastCursor=null, currentQuery="";
+const list=document.getElementById("list");
+const more=document.getElementById("more");
+const q=document.getElementById("q");
+const hint=document.getElementById("hint");
+
+async function checkLock(){
+  const r=await fetch('/api/unlocked'); const j=await r.json();
+  document.getElementById('overlay').style.display = j.unlocked ? 'none':'flex';
+  if(j.unlocked){ load({append:false}); }
 }
-window.addEventListener('DOMContentLoaded', check);
-</script></body></html>
+
+async function doUnlock(){
+  const pw=document.getElementById('pw').value;
+  const r=await fetch('/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+  const j=await r.json();
+  if(j.success){ document.getElementById('overlay').style.display='none'; load({append:false}); }
+  else{ document.getElementById('err').textContent=j.error||'비밀번호 오류'; }
+}
+
+async function load({append=false}={}){
+  if(loading) return; loading=true; hint.textContent='';
+  const params = new URLSearchParams();
+  if(currentQuery) params.set('q', currentQuery);
+  if(append && lastCursor) params.set('before', String(lastCursor));
+  params.set('limit', '30');
+
+  const r=await fetch('/api/articles?'+params.toString());
+  if(r.status===403){ document.getElementById('overlay').style.display='flex'; loading=false; return; }
+  const j=await r.json(); const arr=j.articles||[];
+
+  if(!append) list.innerHTML='';
+  for(const e of arr){
+    const d=document.createElement('div'); d.className='card';
+    d.innerHTML = `
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:center">
+        <a href="${e.link}" target="_blank" rel="noopener">${e.title.replace(/</g,"&lt;")}</a>
+        <span class="badge">${e.source||''}</span>
+      </div>
+      <div class="muted">${new Date(e.published*1000).toLocaleString()}</div>
+    `;
+    list.appendChild(d);
+  }
+
+  if(arr.length>0){
+    lastCursor = arr[arr.length-1].published; // 다음 페이지 커서
+    more.style.display='inline-block';
+  }else{
+    if(!append){ hint.textContent='표시할 기사가 없습니다.'; }
+    more.style.display='none';
+  }
+  loading=false;
+}
+
+more.addEventListener('click',()=>load({append:true}));
+q.addEventListener('keydown',(e)=>{ if(e.key==='Enter'){ currentQuery=q.value.trim(); lastCursor=null; load({append:false}); }});
+window.addEventListener('DOMContentLoaded', checkLock);
+</script>
+</body></html>
 """
 
+# 로컬 디버그용
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
