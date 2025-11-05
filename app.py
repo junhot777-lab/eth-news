@@ -1,365 +1,390 @@
-# app.py  ── ETH 뉴스 수집 뷰어 (최신순, 무한 스크롤, 로그인/로그아웃 OK, 경량)
 import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-import requests
-from flask import Flask, jsonify, request, make_response, redirect, Response
+import feedparser
+from flask import (
+    Flask, request, jsonify, render_template_string,
+    redirect, url_for, session, abort, Response
+)
 
-# ─────────────────────────── 기본 설정 ───────────────────────────
+# ---------------------- 기본 설정 ----------------------
+DB_PATH = os.path.join("/tmp", "news.db")
+os.makedirs("/tmp", exist_ok=True)
+
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET", "eth-news-secret")
 
-ADMIN_PW = "Philia12"
-ADMIN_COOKIE = "admin"           # 값 "1"이면 관리자
-DB_PATH = os.path.join("/tmp", "ethnews.db")  # Render free 한도 고려해서 /tmp 사용
+SITE_PASSWORD = os.environ.get("SITE_PASSWORD", "Philia12")           # 로그인 비번
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", SITE_PASSWORD)       # /admin/fetch, /cron 보호
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()          # 선택: 있으면 LLM 번역 사용
 
-# ─────────────────────────── DB 유틸 ───────────────────────────
+FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
+    "https://www.cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://www.theblock.co/rss",
+]
+ETH_KEYWORDS = [
+    "ethereum"," ether "," eth ","이더리움","vitalik","rollup","layer 2","layer2","staking",
+    "beacon","eip-","l2","arbitrum","optimism","base","etf"
+]
+
+# ---------------------- DB ----------------------
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS articles(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            link  TEXT NOT NULL UNIQUE,
-            source TEXT,
-            pub_ts INTEGER NOT NULL
-        );
+    c = conn.cursor()
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS articles(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        link  TEXT NOT NULL UNIQUE,
+        source TEXT,
+        published_at TEXT,
+        summary TEXT
+      )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_pub ON articles(pub_ts DESC);")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pub ON articles(published_at DESC)")
+    conn.commit()
     conn.close()
 
 init_db()
 
-# ─────────────────────────── 수집 소스 ───────────────────────────
-# 가볍게: RSS/Atom류 위주. (HTML 본문 긁지 않음)
-SOURCES = [
-    # CoinDesk ETH 태그
-    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml&tag=Ethereum",
-    # Decrypt ETH
-    "https://decrypt.co/feed",
-    # Cointelegraph ETH
-    "https://cointelegraph.com/rss",
+# ---------------------- 유틸 ----------------------
+def host_of(url: str) -> str:
+    try:
+        h = urlparse(url).hostname or ""
+        return h.replace("www.", "")
+    except Exception:
+        return ""
+
+def is_eth_related(title: str, desc: str) -> bool:
+    blob = f"{(title or '').lower()} {(desc or '').lower()}"
+    return any(k in blob for k in ETH_KEYWORDS)
+
+def parse_time(entry) -> str:
+    # feedparser가 주는 parsed가 있으면 사용, 없으면 now
+    try:
+        if getattr(entry, "published_parsed", None):
+            return datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc).isoformat()
+        if getattr(entry, "updated_parsed", None):
+            return datetime.fromtimestamp(time.mktime(entry.updated_parsed), tz=timezone.utc).isoformat()
+    except Exception:
+        pass
+    return datetime.now(tz=timezone.utc).isoformat()
+
+def three_line_summary_en(title: str, desc: str) -> str:
+    """외부 API 없이 초슬림 3줄 영문 요약 (제목+요약에서 문장 잘라 3줄)"""
+    def clean(t: str) -> str:
+        return " ".join((t or "").replace("\n"," ").split())
+    t = clean(title)[:140]
+    d = clean(desc)
+    parts = [p.strip() for p in d.replace("•",". ").split(".") if p.strip()]
+    line2 = parts[0][:180] if parts else ""
+    line3 = (parts[1][:180] if len(parts) > 1 else "")
+    lines = [f"• {t}"]
+    if line2: lines.append(f"• {line2}")
+    if line3: lines.append(f"• {line3}")
+    return "\n".join(lines[:3])
+
+# --- 제목 한국어 번역 (오프라인 사전 + 선택적 LLM) ---
+_GLOSS = [
+    ("ethereum","이더리움"), ("layer 2","레이어 2"), ("rollup","롤업"),
+    ("staking","스테이킹"), ("validator","밸리데이터"), ("upgrade","업그레이드"),
+    ("merge","머지"), ("etf","ETF"), ("sec","SEC"), ("price","가격"),
+    ("surge","급등"), ("drop","하락"), ("network","네트워크"), ("fees","수수료"),
+    ("mainnet","메인넷"), ("testnet","테스트넷"), ("airdrop","에어드롭"),
+    ("foundation","재단"), ("proposal","제안"), ("governance","거버넌스")
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Render/eth-news; +https://eth-news.onrender.com)"
-}
+def translate_title_ko_offline(title: str) -> str:
+    s = title or ""
+    low = s.lower()
+    # 긴 단어부터 치환
+    for en, ko in sorted(_GLOSS, key=lambda x: -len(x[0])):
+        low = low.replace(en, ko)
+    # 대충 첫 글자 대문자였던 건 유지 불가 → 그냥 결과 반환
+    return low
 
-def as_epoch(dt_str):
-    # RSS 날짜 문자열을 epoch로 best-effort 변환
+def translate_title_ko(title: str, desc: str) -> str:
+    """OPENAI_API_KEY가 있으면 LLM으로 깔끔 번역, 없으면 오프라인 사전 번역."""
+    if not OPENAI_API_KEY:
+        return translate_title_ko_offline(title)
     try:
-        from email.utils import parsedate_to_datetime
-        return int(parsedate_to_datetime(dt_str).astimezone(timezone.utc).timestamp())
+        import json, urllib.request
+        prompt = (
+            "Translate the following crypto news title into natural Korean. "
+            "Keep it concise and factual, no embellishment.\n\n"
+            f"Title: {title}\n"
+        )
+        req = urllib.request.Request(
+            url="https://api.openai.com/v1/chat/completions",
+            data=json.dumps({
+                "model":"gpt-4o-mini",
+                "messages":[{"role":"user","content":prompt}],
+                "temperature":0.2,
+                "max_tokens":80
+            }).encode("utf-8"),
+            headers={"Authorization":f"Bearer {OPENAI_API_KEY}","Content-Type":"application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = (data["choices"][0]["message"]["content"] or "").strip()
+        return text or translate_title_ko_offline(title)
     except Exception:
-        return int(time.time())
+        return translate_title_ko_offline(title)
 
-def normalize_source(link:str, fallback:str=""):
-    try:
-        host = urlparse(link).hostname or ""
-        return fallback or host.replace("www.", "")
-    except Exception:
-        return fallback or "unknown"
-
-# ─────────────────────────── 관리자: 수집 트리거 ───────────────────────────
-@app.get("/admin/fetch")
-def admin_fetch():
-    # 쿼리스트링 pw 검사
-    pw = request.args.get("pw", "")
-    if pw != ADMIN_PW and request.cookies.get(ADMIN_COOKIE) != "1":
-        return jsonify({"error": "locked"}), 401
-
-    added = 0
+# ---------------------- 수집 ----------------------
+def fetch_once(max_per_feed=25) -> dict:
+    scanned, added = 0, 0
     conn = get_db()
-    try:
-        for feed in SOURCES:
+    c = conn.cursor()
+    for feed_url in FEEDS:
+        try:
+            d = feedparser.parse(feed_url)
+        except Exception:
+            continue
+        src = (getattr(d, "feed", {}) or {}).get("title") or host_of(feed_url)
+        cnt = 0
+        for e in d.entries:
+            if cnt >= max_per_feed:
+                break
+            scanned += 1
+            title = (getattr(e, "title", "") or "").strip()
+            link  = (getattr(e, "link", "") or "").strip()
+            if not title or not link:
+                continue
+            desc = getattr(e, "summary", "") or getattr(e, "description", "") or ""
+            if not is_eth_related(title, desc):
+                continue
+            pub = parse_time(e)
+            summ = three_line_summary_en(title, desc)
             try:
-                r = requests.get(feed, headers=HEADERS, timeout=8)
-                if r.status_code != 200 or not r.text:
-                    continue
-                text = r.text
-
-                # 매우 경량 파서: title/link/pubDate만 뽑는다
-                # 진짜 파서는 feedparser가 편하지만 의존 줄여 메모리/속도 절약
-                # item 단위로 잘라서 최소 파싱
-                parts = text.split("<item")
-                if len(parts) == 1:
-                    parts = text.split("<entry")
-                for raw in parts[1:]:
-                    seg = raw.split("</item>", 1)[0] if "</item>" in raw else raw.split("</entry>",1)[0]
-                    # title
-                    t1 = seg.split("<title",1)
-                    title = ""
-                    if len(t1) > 1:
-                        t2 = t1[1].split(">",1)
-                        if len(t2) > 1:
-                            title = t2[1].split("</title>",1)[0].strip()
-                    # link
-                    link = ""
-                    if "<link>" in seg:
-                        link = seg.split("<link>",1)[1].split("</link>",1)[0].strip()
-                    elif "href=" in seg:  # atom 형식
-                        lk = seg.split("href=",1)[1].split('"',2)
-                        if len(lk) >= 2:
-                            link = lk[1].strip()
-                    # pubDate / updated
-                    pub_ts = int(time.time())
-                    if "<pubDate>" in seg:
-                        pub_ts = as_epoch(seg.split("<pubDate>",1)[1].split("</pubDate>",1)[0].strip())
-                    elif "<updated>" in seg:
-                        pub_ts = as_epoch(seg.split("<updated>",1)[1].split("</updated>",1)[0].strip())
-
-                    if not title or not link:
-                        continue
-
-                    source = normalize_source(link)
-                    try:
-                        conn.execute(
-                            "INSERT INTO articles(title, link, source, pub_ts) VALUES(?,?,?,?)",
-                            (title, link, source, pub_ts)
-                        )
-                        added += 1
-                    except sqlite3.IntegrityError:
-                        # 이미 있는 링크는 스킵
-                        pass
+                c.execute(
+                    "INSERT OR IGNORE INTO articles(title,link,source,published_at,summary) VALUES(?,?,?,?,?)",
+                    (title, link, src, pub, summ)
+                )
+                if c.rowcount > 0:
+                    added += 1
+                    cnt += 1
             except Exception:
-                # 개별 소스 실패는 전체 실패로 안 번지게 무시
                 pass
-    finally:
-        conn.close()
+    conn.commit()
+    conn.close()
+    return {"scanned": scanned, "added": added}
 
-    return jsonify({"ok": True, "added": added, "total": count_articles()})
-
-def count_articles():
+def count_rows():
     conn = get_db()
-    try:
-        cur = conn.execute("SELECT COUNT(*) AS c FROM articles")
-        return int(cur.fetchone()["c"])
-    finally:
-        conn.close()
+    n = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+    conn.close()
+    return n
 
-# ─────────────────────────── API: 무한 스크롤 ───────────────────────────
-@app.get("/api/articles")
-def api_articles():
-    try:
-        limit = max(1, min(50, int(request.args.get("limit", "20"))))
-    except Exception:
-        limit = 20
-    try:
-        offset = max(0, int(request.args.get("offset", "0")))
-    except Exception:
-        offset = 0
-
-    q = request.args.get("q", "").strip()
-
-    conn = get_db()
-    try:
-        if q:
-            rows = conn.execute(
-                "SELECT title, link, source, pub_ts FROM articles "
-                "WHERE title LIKE ? ORDER BY pub_ts DESC LIMIT ? OFFSET ?",
-                (f"%{q}%", limit, offset)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT title, link, source, pub_ts FROM articles "
-                "ORDER BY pub_ts DESC LIMIT ? OFFSET ?",
-                (limit, offset)
-            ).fetchall()
-
-        data = []
-        for r in rows:
-            data.append({
-                "title": r["title"],
-                "link": r["link"],
-                "source": r["source"],
-                "pub_ts": r["pub_ts"],
-                "pub_iso": datetime.fromtimestamp(r["pub_ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            })
-        return jsonify({"articles": data, "next_offset": offset + len(data)})
-    finally:
-        conn.close()
-
-# ─────────────────────────── 로그인/로그아웃 ───────────────────────────
-@app.post("/admin/login")
-def admin_login():
-    pw = (request.json or {}).get("pw", "")
-    if pw == ADMIN_PW:
-        resp = make_response(jsonify({"ok": True}))
-        resp.set_cookie(ADMIN_COOKIE, "1", httponly=True, samesite="Lax", max_age=60*60*6)
-        return resp
-    return jsonify({"ok": False}), 401
-
-@app.route("/admin/logout", methods=["GET", "POST"])
-def admin_logout():
-    resp = make_response(redirect("/"))
-    resp.delete_cookie(ADMIN_COOKIE)
-    return resp
-
-# ─────────────────────────── 프런트 (최신순 무한 쌓기 + 로그아웃 버튼) ───────────────────────────
-@app.get("/")
-def index():
-    # 간단한 정적 HTML. 링크는 target=_blank로 확실히 클릭됨.
-    html = f"""<!doctype html>
+# ---------------------- 템플릿 (ETH 배경 + 제목_번역 + 최신순) ----------------------
+PAGE = r"""<!doctype html>
 <html lang="ko">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>이더리움 실시간 뉴스 집계</title>
 <style>
-  :root {{
-    --bg: #0d0f12;
-    --card: #1a1f29;
-    --text: #dfe6ef;
-    --muted: #9fb0c3;
-    --accent: #7cc4ff;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Pretendard, Apple SD Gothic Neo, 'Noto Sans KR', sans-serif;
-  }}
-
-  .top {{
-    position: sticky;
-    top: 0; z-index: 9999;
-    background: linear-gradient(180deg, rgba(13,15,18,.95), rgba(13,15,18,.85));
-    backdrop-filter: blur(6px);
-    padding: 14px 12px;
-    display: flex; gap: 8px; align-items: center; justify-content: space-between;
-    border-bottom: 1px solid rgba(255,255,255,.05);
-  }}
-  h1 {{ font-size: 20px; margin: 0; }}
-  .muted {{ color: var(--muted); font-size: 12px; }}
-  #q {{
-    flex: 1; max-width: 640px;
-    height: 36px; padding: 0 12px; border-radius: 9px;
-    background: #0f141a; color: var(--text);
-    outline: none; border: 1px solid rgba(255,255,255,.08);
-  }}
-  #logoutBtn {{
-    height: 36px; padding: 0 12px; border-radius: 9px;
-    border: 1px solid rgba(255,255,255,.15); color: #fff;
-    background: #2b3340; cursor: pointer; z-index: 10000;
-  }}
-
-  .wrap {{ max-width: 980px; margin: 0 auto; padding: 12px; }}
-  .card {{
-    background: var(--card);
-    border: 1px solid rgba(255,255,255,.06);
-    border-radius: 14px;
-    padding: 14px;
-    margin: 12px 0;
-  }}
-  .title {{
-    font-size: 20px; margin: 0 0 8px 0;
-  }}
-  .title a {{ color: #b9d8ff; text-decoration: none; }}
-  .meta {{ font-size: 12px; color: var(--muted); margin-bottom: 8px; }}
-  .loader {{ text-align:center; padding: 18px; color: var(--muted); }}
+  :root{--bg1:#0b0f17;--bg2:#101826;--card:#121b2a;--muted:#8aa0bf;--accent:#66d9ff;--border:#213047;--text:#e6f0ff}
+  html,body{height:100%}
+  body{
+    margin:0;color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Apple SD Gothic Neo,Noto Sans KR,sans-serif;
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(102,217,255,.12), transparent 60%),
+      radial-gradient(900px 500px at -10% 20%, rgba(95,158,255,.10), transparent 55%),
+      linear-gradient(160deg, var(--bg1), var(--bg2));
+  }
+  body::before{
+    content:"";position:fixed;inset:0;pointer-events:none;opacity:.05;
+    background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120"><g fill="none" stroke="%23b5e3ff" stroke-width="1.2"><path d="M60 10 25 60l35-16 35 16z"/><path d="M60 10v94"/><path d="M60 104 25 60l35 16 35-16z"/></g></svg>');
+    background-size:220px 220px;
+  }
+  .wrap{max-width:960px;margin:32px auto;padding:0 16px}
+  h1{margin:0 0 6px;font-size:28px}
+  .hint{color:var(--muted);font-size:14px;margin-bottom:14px}
+  .bar{display:flex;gap:8px;margin:10px 0 16px}
+  input[type="text"]{flex:1;padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:#0f1624;color:var(--text);outline:none}
+  .btn{padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:#0f1624;color:var(--text);cursor:pointer}
+  .card{
+    background:rgba(18,27,42,.76);border:1px solid var(--border);border-radius:16px;padding:18px;margin:14px 0;
+    box-shadow:0 6px 20px rgba(0,0,0,.28);backdrop-filter: blur(3px); position:relative;
+  }
+  .ttl{font-size:22px;line-height:1.35;color:#a9ceff;text-decoration:none;position:relative;z-index:2;pointer-events:auto}
+  .ttl:hover{text-decoration:underline}
+  .ko{margin-top:6px;color:#dfeaff;opacity:.95}
+  .meta{color:var(--muted);font-size:13px;margin:6px 0 6px}
+  .sum{white-space:pre-wrap;line-height:1.55;color:#dce9ff}
+  .empt{padding:28px;text-align:center;color:var(--muted)}
+  .login{max-width:400px;margin:90px auto}
+  .center{display:flex;gap:8px;align-items:center;justify-content:center}
 </style>
 </head>
 <body>
-  <div class="top">
-    <div>
-      <h1>이더리움 실시간 뉴스 집계</h1>
-      <div class="muted">최신순 · 아래 '더 보기'로 과거 기사 계속 누적</div>
+<div class="wrap">
+  {% if not session.get('ok') %}
+    <div class="login card">
+      <h1>접속 비밀번호</h1>
+      <p class="hint">허용된 사용자만 열람합니다.</p>
+      <form method="post" action="{{ url_for('login') }}" class="center">
+        <input type="password" name="pw" placeholder="Password" />
+        <button class="btn" type="submit">입장</button>
+      </form>
+      {% if error %}<p class="hint" style="color:#ffb3b3">비밀번호가 틀렸습니다.</p>{% endif %}
     </div>
-    <input id="q" placeholder="제목/매체로 검색 (Enter)" />
-    <button id="logoutBtn" type="button">로그아웃</button>
-  </div>
+  {% else %}
+    <h1>이더리움 실시간 뉴스 집계</h1>
+    <div class="hint">최신순 · 자동 집계(5분마다) · 제목 한국어 번역 표시</div>
 
-  <div class="wrap">
+    <div class="bar">
+      <input id="q" type="text" placeholder="제목/매체로 검색 (Enter)">
+      <button class="btn" onclick="logout()">로그아웃</button>
+    </div>
+
     <div id="list"></div>
-    <div id="more" class="loader">불러오는 중...</div>
-  </div>
+    <div class="center" style="margin:16px 0;">
+      <button id="more" class="btn" onclick="loadMore()">더 보기</button>
+    </div>
+  {% endif %}
+</div>
 
+{% if session.get('ok') %}
 <script>
-let offset = 0;
-let done = false;
-let loading = false;
-let query = "";
+let page = 1, q = "", autoload = true;
 
-const list = document.getElementById('list');
-const more = document.getElementById('more');
-const q = document.getElementById('q');
-
-function card(item){{
-  const d = new Date(item.pub_ts * 1000);
-  const when = d.toISOString().replace('T',' ').slice(0,19) + " UTC";
+function esc(s){return s.replace(/[&<>\"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]))}
+function fmt(d){try{return new Date(d).toLocaleString('ko-KR')}catch(_){return d}}
+function row(a){
+  let host=""; try{ host=new URL(a.link).hostname.replace(/^www\./,""); }catch(_){ host=a.source||""; }
+  const sums=(a.summary||"").trim();
+  const titleKo=a.title_ko?`<div class="ko">🛈 ${esc(a.title_ko)}</div>`:"";
   return `
     <div class="card">
-      <h2 class="title"><a href="${{item.link}}" target="_blank" rel="noopener">${{item.title}}</a></h2>
-      <div class="meta">${{item.source}} | ${{when}}</div>
-    </div>
-  `;
-}}
+      <a class="ttl" href="${a.link}" target="_blank" rel="noopener noreferrer">${esc(a.title)}</a>
+      ${titleKo}
+      <div class="meta">${esc(host)} | ${fmt(a.published_at)}</div>
+      ${sums?`<div class="sum">${esc(sums)}</div>`:""}
+    </div>`;
+}
 
-async function load() {{
-  if (done || loading) return;
-  loading = true;
-  more.textContent = "불러오는 중...";
-  try {{
-    const url = `/api/articles?limit=20&offset=${{offset}}` + (query ? `&q=${{encodeURIComponent(query)}}` : "");
-    const res = await fetch(url);
-    const js = await res.json();
-    if (js.articles && js.articles.length) {{
-      list.insertAdjacentHTML('beforeend', js.articles.map(card).join(''));
-      offset = js.next_offset ?? (offset + js.articles.length);
-      more.textContent = "아래로 스크롤하면 더 보기";
-    }} else {{
-      done = true;
-      more.textContent = "더 이상 항목 없음";
-    }}
-  }} catch (e) {{
-    more.textContent = "불러오기 실패";
-  }} finally {{
-    loading = false;
-  }}
-}}
+async function fetchPage(reset=false){
+  const params = new URLSearchParams({ page:String(page), q:q, limit:"20" });
+  const r = await fetch('/api/articles?'+params.toString(), {cache:'no-store'});
+  if(!r.ok) return;
+  const data = await r.json();
+  const list = document.getElementById('list');
+  if(reset) list.innerHTML = "";
+  const items = data.articles||[];
+  if(items.length===0 && page===1){ list.innerHTML = `<div class="card empt">표시할 기사가 없습니다.</div>`; document.getElementById('more').style.display='none'; return; }
+  items.forEach(a=> list.insertAdjacentHTML('beforeend', row(a)));
+  document.getElementById('more').style.display = items.length<20 ? 'none':'inline-block';
+}
 
-function nearBottom(){{
-  return window.innerHeight + window.scrollY >= document.body.offsetHeight - 600;
-}}
+function loadMore(){ page += 1; fetchPage(false); }
 
-window.addEventListener('scroll', ()=>{{ if(nearBottom()) load(); }});
-window.addEventListener('load', load);
+document.getElementById('q').addEventListener('keydown', e=>{
+  if(e.key==='Enter'){ q = e.target.value.trim(); page=1; fetchPage(true); }
+});
 
-q.addEventListener('keydown', (ev)=>{{
-  if(ev.key === 'Enter'){{
-    query = q.value.trim();
-    list.innerHTML = "";
-    offset = 0; done = false;
-    load();
-  }}
-}});
-
-// 로그아웃 눌리게 확실히
-document.getElementById('logoutBtn').addEventListener('click', async (e) => {{
-  e.preventDefault(); e.stopPropagation();
-  try {{
-    const r = await fetch('/admin/logout', {{method:'POST'}});
-    if(!r.ok) await fetch('/admin/logout', {{method:'GET'}});
-  }} catch(_){{
-  }}
-  location.replace('/');
-}});
+// --- 자동 집계: 로그인 세션에서 5분마다 수집 + 새로고침 ---
+async function pulse(){ try{ await fetch('/pulse', {method:'POST'}); }catch(_){} }
+setInterval(()=>{ pulse(); if(autoload){ page=1; fetchPage(true);} }, 300000); // 5분
+fetchPage(true); pulse();
 </script>
+{% endif %}
 </body>
 </html>
 """
-    return Response(html, mimetype="text/html")
 
-# ─────────────────────────── WSGI 엔트리 ───────────────────────────
+# ---------------------- 라우트 ----------------------
+@app.get("/")
+def index():
+    err = request.args.get("err")
+    return render_template_string(PAGE, error=bool(err))
+
+@app.post("/login")
+def login():
+    pw = request.form.get("pw","")
+    if pw == SITE_PASSWORD:
+        session["ok"] = True
+        return redirect(url_for("index"))
+    return redirect(url_for("index", err=1))
+
+@app.post("/logout")
+def logout():
+    session.clear()
+    return ("", 204)
+
+@app.get("/api/articles")
+def api_articles():
+    if not session.get("ok"):
+        return jsonify({"error":"locked"}), 401
+    limit = max(1, min(50, int(request.args.get("limit", "20"))))
+    page  = max(1, int(request.args.get("page", "1")))
+    q     = (request.args.get("q") or "").strip()
+
+    offset = (page - 1) * limit
+    conn = get_db()
+    c = conn.cursor()
+    if q:
+        c.execute("""
+          SELECT title, link, source, published_at, summary
+          FROM articles
+          WHERE title LIKE ? OR source LIKE ?
+          ORDER BY datetime(published_at) DESC, id DESC
+          LIMIT ? OFFSET ?
+        """, (f"%{q}%", f"%{q}%", limit, offset))
+    else:
+        c.execute("""
+          SELECT title, link, source, published_at, summary
+          FROM articles
+          ORDER BY datetime(published_at) DESC, id DESC
+          LIMIT ? OFFSET ?
+        """, (limit, offset))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    # 제목 한국어 번역을 응답에 동적으로 포함
+    out = []
+    for r in rows:
+        r["title_ko"] = translate_title_ko(r["title"], r.get("summary") or "")
+        out.append(r)
+    return jsonify({"articles": out})
+
+@app.get("/admin/fetch")
+def admin_fetch():
+    pw = request.args.get("pw","")
+    if pw != ADMIN_PASSWORD:
+        return jsonify({"error":"locked"}), 401
+    info = fetch_once()
+    total = count_rows()
+    return jsonify({"ok": True, **info, "total": total})
+
+@app.post("/pulse")
+def pulse():
+    """로그인된 세션에서만 호출 가능. 5분마다 짧게 수집해서 누적."""
+    if not session.get("ok"):
+        return jsonify({"error":"locked"}), 401
+    info = fetch_once(max_per_feed=10)
+    return jsonify({"ok": True, **info})
+
+@app.get("/cron")
+def cron():
+    """외부 크론(예: Render Jobs/uptime cron)에서 호출: ?token=비번"""
+    token = request.args.get("token","")
+    if token != ADMIN_PASSWORD:
+        return jsonify({"error":"locked"}), 401
+    info = fetch_once()
+    return jsonify({"ok": True, **info, "total": count_rows()})
+
+# ---------------------- 실행 ----------------------
 if __name__ == "__main__":
-    # 로컬 테스트용
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
