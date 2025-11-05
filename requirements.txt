@@ -1,5 +1,4 @@
-flask
-requests
-beautifulsoup4
-gunicorn
-openai
+flask==3.0.3
+gunicorn==23.0.0
+requests==2.32.3
+feedparser==6.0.11

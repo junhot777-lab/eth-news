@@ -1,21 +1,26 @@
-import os, sqlite3, time, re, html
+import os
+import sqlite3
+import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse
-import feedparser
-import httpx
-import trafilatura
-import tldextract
+from typing import List, Dict
 
+import requests
+import feedparser
 from flask import Flask, request, jsonify, Response
 
-# ---------- 설정 ----------
-DB_PATH = os.getenv("DB_PATH", "/tmp/ethnews.db")
-KEYWORD = os.getenv("KEYWORD", "ethereum|ether|이더리움")
-ADMIN_PW = os.getenv("ADMIN_PW", "Philia12")
-FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL", "900"))  # 초
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # 있으면 한국어 요약 활성화
+# -----------------------
+# Config
+# -----------------------
+APP_TITLE = "이더리움 실시간 뉴스 집계기"
+DB_DIR = os.environ.get("DB_DIR", "/tmp/data")
+DB_PATH = os.path.join(DB_DIR, "news.db")
 
-# RSS 후보들 (가볍게 늘려도 됨)
+ETH_KEYWORDS = [
+    "ethereum", "ether", "eth", "vitalik", "eip-", "rollup", "l2",
+    "optimism", "arbitrum", "zkSync", "base chain", "beacon chain",
+    "staking", "withdrawal", "validator", "sepoli", "holesky"
+]
+
 FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
     "https://decrypt.co/feed",
@@ -23,264 +28,289 @@ FEEDS = [
     "https://www.theblock.co/rss",
 ]
 
+USER_AGENT = "eth-news (Render) - requests/2.x"
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+DISABLE_SUMMARY = os.environ.get("DISABLE_SUMMARY", "").strip() == "1"
+
+# -----------------------
+# App + DB
+# -----------------------
 app = Flask(__name__)
 
-# ---------- DB ----------
-def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with sqlite3.connect(DB_PATH) as con:
-        c = con.cursor()
+def ensure_db():
+    os.makedirs(DB_DIR, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
         c.execute("""
-        CREATE TABLE IF NOT EXISTS articles(
+        CREATE TABLE IF NOT EXISTS articles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             link TEXT UNIQUE NOT NULL,
             source TEXT,
-            published_ts INTEGER,
-            summary_ko TEXT DEFAULT NULL
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub ON articles(published_ts DESC)")
-        con.commit()
+            published_at TEXT,
+            summary_en TEXT DEFAULT ''
+        )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_published ON articles(published_at DESC)")
+        conn.commit()
 
-init_db()
+ensure_db()
 
-# ---------- 유틸 ----------
-def domain_name(url:str) -> str:
+# -----------------------
+# Utils
+# -----------------------
+def is_eth_related(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(k in t for k in ETH_KEYWORDS)
+
+def http_get(url: str, timeout: float = 6.0) -> requests.Response:
+    return requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+
+def parse_time(entry) -> str:
+    # RFC822 -> ISO8601. Fallback to now().
     try:
-        ext = tldextract.extract(url)
-        if ext.domain:
-            return ext.domain.capitalize()
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            ts = time.mktime(entry.published_parsed)
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
     except Exception:
         pass
-    return urlparse(url).netloc or ""
+    return datetime.now(tz=timezone.utc).isoformat()
 
-_kw = re.compile(KEYWORD, re.I)
-
-def is_eth_related(title:str, summary:str=""):
-    text = f"{title} {summary}".lower()
-    return bool(_kw.search(text))
-
-def parse_time(entry):
-    # feedparser의 published_parsed 우선
-    if getattr(entry, "published_parsed", None):
-        return int(time.mktime(entry.published_parsed))
-    if getattr(entry, "updated_parsed", None):
-        return int(time.mktime(entry.updated_parsed))
-    return int(time.time())
-
-# ---------- 본문 추출 ----------
-def fetch_article_text(url:str, timeout=12.0) -> str:
+# -----------------------
+# Summarizer (English 3 lines)
+# -----------------------
+def summarize_english_3_lines(title: str, desc: str) -> str:
+    if DISABLE_SUMMARY or not OPENAI_API_KEY:
+        return ""
+    # Keep prompts and tokens tiny to avoid OOM/timeouts on free tier
+    content = (desc or "").strip()
+    content = content[:700]  # hard cap context
+    prompt = (
+        "You are a concise crypto news assistant. "
+        "Summarize the following news in exactly 3 short English bullet lines. "
+        "Each bullet must be under 18 words, factual, and non-redundant.\n\n"
+        f"Title: {title}\n"
+        f"Body: {content}\n\n"
+        "Output format:\n"
+        "- line 1\n- line 2\n- line 3"
+    )
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        }) as cli:
-            r = cli.get(url)
-            r.raise_for_status()
-            downloaded = trafilatura.extract(r.text, include_comments=False, include_tables=False)
-            return downloaded or ""
+        # Minimal client without bring-in heavy libs
+        import json
+        import urllib.request
+
+        req = urllib.request.Request(
+            url="https://api.openai.com/v1/chat/completions",
+            data=json.dumps({
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 180,
+                "timeout": 3000
+            }).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = data["choices"][0]["message"]["content"].strip()
+        # Safety: keep only first 3 lines
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("-")]
+        return "\n".join(lines[:3])
     except Exception:
+        # Fail silently to keep page responsive
         return ""
 
-# ---------- 기본 추출 요약(영문) ----------
-_SENT_SPLIT = re.compile(r'(?<=[\.\?\!])\s+')
-def keyword_score(sent:str) -> float:
-    s = sent.lower()
-    score = 0.0
-    # 가중 키워드
-    for w, wgt in [
-        ("ethereum", 3), ("ether", 2.5), ("eth", 2),
-        ("price", 1.2), ("upgrade", 1.1), ("etf", 1.1),
-        ("defi", 1.0), ("layer 2", 1.0), ("staking", 1.0),
-        ("merge", 1.0), ("fund", 0.9), ("market", 0.8),
-    ]:
-        if w in s: score += wgt
-    # 길이 페널티
-    words = len(sent.split())
-    if words > 5: score += min(2.0, words/40)
-    return score
+# -----------------------
+# Fetch & Store
+# -----------------------
+def upsert_article(title: str, link: str, source: str, published_at: str, summary: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        try:
+            c.execute("""
+                INSERT OR IGNORE INTO articles(title, link, source, published_at, summary_en)
+                VALUES(?,?,?,?,?)
+            """, (title, link, source, published_at, summary))
+            # If already exists but summary empty, try to fill it once
+            if c.rowcount == 0 and summary:
+                c.execute("""
+                    UPDATE articles
+                    SET summary_en = CASE WHEN IFNULL(summary_en,'')='' THEN ? ELSE summary_en END
+                    WHERE link = ?
+                """, (summary, link))
+        finally:
+            conn.commit()
 
-def extract_3lines(text:str) -> list:
-    sents = [s.strip() for s in _SENT_SPLIT.split(text) if len(s.strip())>30]
-    if not sents:
-        return []
-    scored = sorted(sents, key=keyword_score, reverse=True)
-    pick = []
-    seen = set()
-    for s in scored:
-        sig = s[:50]
-        if sig in seen: 
-            continue
-        seen.add(sig)
-        pick.append(s)
-        if len(pick) == 3: break
-    return pick
-
-# ---------- 한국어 요약 (선택적: OPENAI_API_KEY 필요) ----------
-def summarize_ko(title:str, body_text:str) -> list:
-    # 키가 없으면 기본 추출 영문을 반환하고, 렌더링 시 한국어 접두사만 붙인다.
-    base = extract_3lines(body_text or title)
-    if not OPENAI_API_KEY:
-        return base  # 영문 3줄 반환
-    try:
-        import httpx
-        sys_prompt = (
-            "다음 기사의 핵심만 한국어로 정확하고 간결하게 3줄 bullet로 요약해줘. "
-            "과장 금지, 수치/주체를 명확히, 각 줄은 18~40자."
-        )
-        user = f"제목: {title}\n본문:\n{body_text[:4000]}"
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role":"system","content":sys_prompt},
-                {"role":"user","content":user}
-            ],
-            "temperature": 0.2,
-        }
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
-        with httpx.Client(timeout=20) as cli:
-            r = cli.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
-            r.raise_for_status()
-            text = r.json()["choices"][0]["message"]["content"].strip()
-        lines = [re.sub(r'^[\-\•\*]\s*','',ln).strip() for ln in text.splitlines() if ln.strip()]
-        return [ln for ln in lines if ln][:3] or base
-    except Exception:
-        return base
-
-# ---------- 수집 ----------
-def fetch_once():
+def fetch_once() -> Dict[str, int]:
+    scanned = 0
     added = 0
-    with sqlite3.connect(DB_PATH) as con:
-        c = con.cursor()
-        for url in FEEDS:
-            try:
-                feed = feedparser.parse(url)
-                for e in getattr(feed, "entries", []):
-                    title = html.unescape(getattr(e, "title", "")).strip()
-                    link = getattr(e, "link", "").strip()
-                    summary = html.unescape(getattr(e, "summary", "")).strip()
-                    if not title or not link:
-                        continue
-                    if not is_eth_related(title, summary):
-                        continue
-                    ts = parse_time(e)
-                    src = domain_name(link)
+    for feed_url in FEEDS:
+        try:
+            resp = http_get(feed_url, timeout=8)
+            resp.raise_for_status()
+            parsed = feedparser.parse(resp.content)
+        except Exception:
+            continue
 
-                    try:
-                        c.execute("INSERT OR IGNORE INTO articles(title, link, source, published_ts) VALUES(?,?,?,?)",
-                                  (title, link, src, ts))
-                        if c.rowcount:
-                            # 새로 들어온 기사만 본문 요약 시도
-                            body = fetch_article_text(link)
-                            ko3 = summarize_ko(title, body)
-                            # 저장은 줄바꿈으로
-                            c.execute("UPDATE articles SET summary_ko=? WHERE link=?", ("\n".join(ko3) if ko3 else None, link))
-                            added += 1
-                    except Exception:
-                        pass
-            except Exception:
+        for e in parsed.entries[:50]:  # gentle cap
+            scanned += 1
+            title = getattr(e, "title", "") or ""
+            link = getattr(e, "link", "") or ""
+            source = parsed.feed.get("title", "") if getattr(parsed, "feed", None) else ""
+            if not title or not link:
                 continue
-        con.commit()
-    return added
 
-# ---------- 라우트 ----------
-@app.get("/")
+            desc = ""
+            if hasattr(e, "summary"):
+                desc = e.summary
+            elif hasattr(e, "description"):
+                desc = e.description
+
+            if not (is_eth_related(title) or is_eth_related(desc)):
+                continue
+
+            published_at = parse_time(e)
+            summary = summarize_english_3_lines(title, desc)
+            before_add = count_total()
+            upsert_article(title.strip(), link.strip(), source.strip(), published_at, summary)
+            after_add = count_total()
+            if after_add > before_add:
+                added += 1
+    return {"scanned": scanned, "added": added, "total": count_total()}
+
+def count_total() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM articles")
+        return int(c.fetchone()[0])
+
+# -----------------------
+# Routes
+# -----------------------
+@app.route("/healthz")
+def health():
+    return "ok"
+
+@app.route("/api/articles")
+def api_articles():
+    try:
+        limit = max(1, min(int(request.args.get("limit", "50")), 200))
+    except Exception:
+        limit = 50
+    q = (request.args.get("q") or "").strip().lower()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        if q:
+            c.execute("""
+                SELECT title, link, source, published_at, summary_en
+                FROM articles
+                WHERE lower(title) LIKE ? OR lower(source) LIKE ?
+                ORDER BY datetime(published_at) DESC
+                LIMIT ?
+            """, (f"%{q}%", f"%{q}%", limit))
+        else:
+            c.execute("""
+                SELECT title, link, source, published_at, summary_en
+                FROM articles
+                ORDER BY datetime(published_at) DESC
+                LIMIT ?
+            """, (limit,))
+        rows = c.fetchall()
+
+    articles = []
+    for title, link, source, published_at, summary_en in rows:
+        articles.append({
+            "title": title, "link": link, "source": source,
+            "published_at": published_at, "summary_en": summary_en
+        })
+    return jsonify({"articles": articles})
+
+@app.route("/admin/fetch")
+def admin_fetch():
+    # Simple guard to avoid randoms hitting it
+    pw = request.args.get("pw", "")
+    if pw != os.environ.get("ADMIN_PW", "Philia12"):
+        return jsonify({"error": "locked"}), 401
+    t0 = time.time()
+    result = fetch_once()
+    result["took_ms"] = int((time.time() - t0) * 1000)
+    return jsonify(result)
+
+@app.route("/")
 def index():
-    # 간단 템플릿(최신순 상단)
-    return Response(f"""
-<!doctype html><html lang="ko"><meta charset="utf-8">
-<title>이더리움 실시간 뉴스 집계</title>
-<meta name=viewport content="width=device-width,initial-scale=1">
+    # Ultra-light HTML to avoid Jinja and templates
+    html = f"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{APP_TITLE}</title>
 <style>
-body{{background:#0e0f12;color:#e5e7eb;font-family:system-ui,Segoe UI,Apple SD Gothic Neo,sans-serif;margin:0}}
-.wrap{{max-width:860px;margin:32px auto;padding:0 16px}}
-h1{{font-size:28px;margin:0 0 8px}}
-.sub{{color:#9ca3af;font-size:13px;margin-bottom:16px}}
-.search{{width:100%;padding:14px 16px;border-radius:10px;border:1px solid #374151;background:#0b0c0f;color:#e5e7eb}}
-.card{{background:#17181b;border:1px solid #2a2d33;border-radius:14px;padding:16px;margin:14px 0}}
-.title{{font-size:22px;color:#93c5fd;text-decoration:none}}
-.meta{{color:#9ca3af;font-size:13px;margin-top:6px}}
-.badge{{background:#222;border:1px solid #333;color:#cbd5e1;border-radius:999px;padding:3px 10px;margin-left:6px;font-size:12px}}
-.summary{{margin-top:10px;line-height:1.35}}
-.more{{display:block;width:100%;padding:12px 14px;margin:20px 0;background:#0b0c0f;border:1px solid #374151;color:#e5e7eb;border-radius:10px}}
+  body {{ background:#0f1115; color:#d7e1ec; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }}
+  .wrap {{ max-width:920px; margin:28px auto; padding:0 16px; }}
+  h1 {{ font-size:28px; margin:0 0 6px; }}
+  .hint {{ opacity:.7; font-size:13px; margin-bottom:16px; }}
+  #q {{ width:100%; padding:10px 12px; border-radius:8px; border:1px solid #2a2f3a; background:#12151c; color:#d7e1ec; }}
+  .card {{ border:1px solid #2a2f3a; background:#12151c; border-radius:12px; padding:14px 16px; margin:14px 0; }}
+  .title a {{ color:#98c7ff; text-decoration:none; }}
+  .meta {{ font-size:12px; opacity:.75; margin:6px 0 8px; }}
+  .sum {{ white-space:pre-wrap; line-height:1.35; }}
+  .badge {{ float:right; opacity:.8; font-size:12px; border:1px solid #2a2f3a; padding:2px 8px; border-radius:999px; }}
+  .more {{ display:block; text-align:center; padding:10px; border-radius:10px; border:1px solid #2a2f3a; color:#d7e1ec; text-decoration:none; }}
 </style>
-<div class=wrap>
+</head>
+<body>
+<div class="wrap">
   <h1>이더리움 실시간 뉴스 집계</h1>
-  <div class=sub>최신순 · 아래 ‘더 보기’로 과거 기사 누적 · 요약 3줄 표시</div>
-  <input class=search id=q placeholder="제목/매체로 검색 (Enter)">
-  <div id=list></div>
-  <button class=more id=more>더 보기</button>
+  <div class="hint">최신순 • 요약은 영어 3줄 • 아래 검색 가능</div>
+  <input id="q" placeholder="제목/매체로 검색 (Enter)" />
+  <div id="list"></div>
+  <a id="more" href="#" class="more">더 보기</a>
 </div>
 <script>
-let page=0, q="";
-async function load(reset=false){{
-  const r=await fetch(`/api/articles?page=${{page}}&q=${{encodeURIComponent(q)}}`);
-  const j=await r.json();
-  const box=document.querySelector("#list");
-  if(reset) box.innerHTML="";
-  j.articles.forEach(a=>{{
-    const div=document.createElement("div"); div.className="card";
-    const sum = a.summary_ko ? a.summary_ko.split("\\n").map(s=>"• "+s).join("<br>") : "";
-    div.innerHTML = `
-      <a class="title" href="${{a.link}}" target="_blank" rel="noopener">${{a.title}}</a>
-      <div class="meta">${{a.date}}<span class="badge">${{a.source}}</span></div>
-      <div class="summary">${{sum}}</div>
-    `;
-    box.appendChild(div);
-  }});
-  if(j.articles.length===0) document.querySelector("#more").disabled=true;
-}}
-document.querySelector("#more").onclick=()=>{{page++;load(false)}};
-document.querySelector("#q").addEventListener("keydown",e=>{{
-  if(e.key==="Enter"){{ q=e.target.value.trim(); page=0; document.querySelector("#more").disabled=false; load(true); }}
-}});
-load(true);
+  let next = 0, page = 20, q = "";
+  const list = document.getElementById("list");
+  const more = document.getElementById("more");
+  const qi = document.getElementById("q");
+
+  async function load(reset=false){
+    const limit = reset ? Math.max(page, next || page) : page;
+    const url = "/api/articles?limit=" + limit + (q ? "&q=" + encodeURIComponent(q) : "");
+    const r = await fetch(url, {headers: {"Cache-Control":"no-cache"}});
+    const data = await r.json();
+    const items = data.articles || [];
+    if(reset){ list.innerHTML=""; next = 0; }
+    const slice = items.slice(next, next + page);
+    slice.forEach(a => {{
+      const el = document.createElement("div");
+      el.className="card";
+      const time = (a.published_at||"").replace("T"," ").slice(0,19).replace("+00:00","");
+      el.innerHTML = `
+        <div class="title"><a href="${{a.link}}" target="_blank" rel="noopener">${{a.title}}</a>
+          <span class="badge">${{a.source||""}}</span>
+        </div>
+        <div class="meta">${{time}}</div>
+        ${{
+          a.summary_en ? `<div class="sum">${{a.summary_en}}</div>` : ``
+        }}
+      `;
+      list.appendChild(el);
+    }});
+    next += slice.length;
+    more.style.display = (next < items.length) ? "block" : "none";
+  }
+  more.addEventListener("click", e => {{ e.preventDefault(); load(false); }});
+  qi.addEventListener("keydown", e => {{ if(e.key === "Enter") {{ q = qi.value.trim(); next = 0; load(true); }} }});
+  load(true);
 </script>
-""","text/html")
-
-@app.get("/api/articles")
-def api_articles():
-    page = max(int(request.args.get("page", "0")), 0)
-    q = (request.args.get("q") or "").strip()
-    with sqlite3.connect(DB_PATH) as con:
-        c = con.cursor()
-        sql = "SELECT title,link,source,published_ts,COALESCE(summary_ko,'') FROM articles "
-        params = []
-        if q:
-            sql += "WHERE title LIKE ? OR source LIKE ? "
-            params += [f"%{q}%", f"%{q}%"]
-        sql += "ORDER BY published_ts DESC LIMIT 20 OFFSET ?"
-        params.append(page*20)
-        rows = c.execute(sql, params).fetchall()
-    items = []
-    for title, link, source, ts, sumko in rows:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%Y. %m. %d. %p %I:%M:%S")
-        items.append({
-            "title": title,
-            "link": link,
-            "source": source,
-            "date": dt,
-            "summary_ko": sumko
-        })
-    return jsonify({"articles": items})
-
-@app.get("/admin/fetch")
-def admin_fetch():
-    if request.args.get("pw") != ADMIN_PW:
-        return jsonify({"error":"locked"})
-    added = fetch_once()
-    return jsonify({"ok": True, "added": added, "total": count_total()})
-
-def count_total():
-    with sqlite3.connect(DB_PATH) as con:
-        c = con.cursor()
-        n = c.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-        return n
-
-# 시작 시 한 번 당겨두기
-try:
-    fetch_once()
-except Exception:
-    pass
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
